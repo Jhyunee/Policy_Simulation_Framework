@@ -47,7 +47,7 @@ python main.py --help
 기본 PDF 파서는 `pypdf`입니다. `pdf.parser: opendataloader`를 사용하려면 `opendataloader-pdf`와 Java 11+가 필요합니다. Gemini 및 Zep도 선택 기능입니다.
 
 ```bash
-# 해당 기능을 사용할 때만 설치
+# Install only for the optional integrations you use.
 python -m pip install -r requirements-optional.txt
 ```
 
@@ -57,19 +57,34 @@ python -m pip install -r requirements-optional.txt
 dataset/<country>/<policy>/input_policy/policy.pdf
 ```
 
-예를 들어 `--policy kor/example`은 `dataset/kor/example/input_policy/`를 읽습니다. 그 폴더에 PDF가 없으면 `.md` 또는 `.markdown`을 읽습니다. PDF와 Markdown이 함께 있으면 PDF가 우선합니다. 입력 문서는 직접 준비합니다.
+예를 들어 `--policy kor/bk21`은 `dataset/kor/bk21/input_policy/`를 읽습니다. 그 폴더에 PDF가 없으면 `.md` 또는 `.markdown`을 읽습니다. PDF와 Markdown이 함께 있으면 PDF가 우선합니다. 입력 문서는 직접 준비합니다.
 
 ```bash
-mkdir -p dataset/kor/example/input_policy
-# 위 폴더에 분석할 정책 PDF 또는 Markdown을 넣습니다.
+mkdir -p dataset/kor/bk21/input_policy
+# Place the BK21 policy PDF or Markdown in this directory.
 ```
 
-### Nemotron 데이터: 기본 scope_definer 방식
+### 페르소나 구성 방식 선택
 
-기본 설정은 로컬 parquet를 DuckDB로 조회합니다. 아래 다운로드를 실행하거나 기존 parquet를 같은 경로에 배치합니다. 데이터는 정리본에 포함하지 않았습니다.
+프레임워크는 **Nemotron 표집(`scope_definer`)**과 **KG 기반 생성(`kg_gen`)**을 지원합니다. 두 방식 모두 정책 KG의 행위자·역할과 정책 맥락을 출발점으로 삼고, 동일한 Stage 1 → Stage 2 ToC 인터페이스를 사용합니다. 후보를 얻는 방법이 다른 두 실험 조건입니다.
+
+| 항목 | Nemotron 표집 (`scope_definer`) | KG 기반 생성 (`kg_gen`) |
+|---|---|---|
+| 후보 구성 | Nemotron 데이터에서 정책 역할에 맞는 프로필 조회·표집 | LLM이 정책 역할에 맞는 프로필 생성 |
+| 근거 | KG 행위자·정책 맥락 + 데이터에 존재하는 속성 조합 | KG 행위자·정책 맥락 + 생성 프롬프트 |
+| 준비 요건 | 정책 KG, LLM API, 국가별 Nemotron parquet | 정책 KG, LLM API, 국가별 필드 정의 |
+| 주요 설정 | `persona.scope_definer` | `persona.kg_gen` |
+| 후보 수 조절 | `target_pool_size`, `min_pool_size` | `personas_per_entity` |
+| 공통 출력 | `stage1_result.json`, `simulation_personas.json` | `stage1_result.json`, `simulation_personas.json` |
+
+아래 YAML은 `config/base.yaml`의 **해당 항목만 수정하는 예시**입니다. 기존 설정 파일 전체를 덮어쓰지 않습니다. 저장소에 들어 있는 `persona.sampler: scope_definer`는 초기 선택값이며, 두 방식의 우선순위나 성능 차이를 뜻하지 않습니다.
+
+#### A. Nemotron 표집 (`scope_definer`)
+
+**준비:** 로컬 Nemotron parquet와 제공된 국가별 필드·enum을 사용합니다. 아래 다운로드를 실행하거나 기존 parquet를 같은 경로에 배치합니다. 데이터 본체는 저장소에 포함하지 않았습니다.
 
 ```bash
-python - <<'PY'
+python - <<'PYDATA'
 from huggingface_hub import snapshot_download
 snapshot_download(
     repo_id="nvidia/Nemotron-Personas-Korea",
@@ -77,10 +92,46 @@ snapshot_download(
     local_dir="dataset/processed/nemotron_kor/Nemotron-Personas-Korea",
     allow_patterns=["data/*.parquet"],
 )
-PY
+PYDATA
 ```
 
-| `--policy` 국가 접두사 | 필드 패키지/저장 폴더 | 데이터셋 이름 |
+**설정:** `persona.sampler`를 `scope_definer`로 지정하고, parquet 경로와 후보 풀 크기를 설정합니다.
+
+```yaml
+persona:
+  sampler: scope_definer
+  scope_definer:
+    values_module: dataset.processed.nemotron_kor
+    parquet_glob: dataset/processed/nemotron_kor/Nemotron-Personas-Korea/data/*.parquet
+    min_pool_size: 300
+    target_pool_size: 300
+    fallback:
+      enabled: true
+      mode: random_full_nemotron
+```
+
+**구성 흐름:** LLM이 KG 행위자에 맞는 연령·학력 범위를 제안하고, DuckDB가 해당 속성 조합의 직업 후보를 조회합니다. LLM은 direct/plausible/weak 범위별 직업을 선택하고, 필터링된 프로필로 페르소나 후보 풀을 구성합니다. 풀이 부족할 때 전체 Nemotron에서 무작위 표집을 허용할지는 `fallback.enabled`로 지정합니다. 허용하지 않으려면 `false`로 바꾸고 실행 로그를 확인합니다.
+
+#### B. KG 기반 생성 (`kg_gen`)
+
+**준비:** 정책 KG, LLM API 및 저장소에 포함된 국가별 필드 정의를 사용합니다. Nemotron parquet는 필요하지 않습니다. 생성 프로필은 동일한 후속 처리에 전달할 수 있도록 공통 페르소나 스키마로 정리됩니다.
+
+**설정:** `persona.sampler`를 `kg_gen`으로 지정하고, 생성 국가·행위자당 후보 수·생성 온도를 설정합니다.
+
+```yaml
+persona:
+  sampler: kg_gen
+  kg_gen:
+    country: kor
+    personas_per_entity: 5
+    temperature: 0.9
+```
+
+**구성 흐름:** KG의 행위자·역할 및 정책 맥락을 프롬프트에 전달하고, LLM이 직업·전문성·목표·인구통계 속성을 갖춘 후보 프로필을 생성합니다. 생성된 프로필을 정책 역할과 연결한 뒤 공통 후보 풀에 전달합니다. `personas_per_entity`는 개인 또는 조직 대표 후보를 생성하는 경로에 적용됩니다. 일반 조직 행위자는 설정에 따라 기관 프로필로 유지되며, 고정 역할 패널에서는 조직 대표 페르소나로 다룰 수 있습니다.
+
+#### 국가 매핑과 공통 실행 설정
+
+| `--policy` 국가 접두사 | 필드 패키지/저장 폴더 | Nemotron 표집 시 데이터셋 이름 |
 |---|---|---|
 | `kor` | `nemotron_kor` | `Nemotron-Personas-Korea` |
 | `singapore` | `nemotron_sg` | `Nemotron-Personas-Singapore` |
@@ -88,25 +139,27 @@ PY
 | `fr` | `nemotron_fr` | `Nemotron-Personas-France` |
 | `jp` | `nemotron_jp` | `Nemotron-Personas-Japan` |
 
-예상 parquet 경로는 `dataset/processed/<폴더>/<데이터셋 이름>/data/*.parquet`입니다. `--policy`는 입력 경로, 국가별 sampler 설정, 출력 경로를 함께 바꿉니다. 표에 없는 국가는 데이터 스키마와 국가 매핑을 별도로 추가해야 합니다.
+표집 방식의 parquet 경로는 `dataset/processed/<폴더>/<데이터셋 이름>/data/*.parquet`입니다. `--policy`는 두 방식 모두 입력 경로, 국가별 sampler 설정, 출력 경로를 함께 바꿉니다. 표에 없는 국가는 데이터 스키마와 국가 매핑을 별도로 추가해야 합니다.
 
-**parquet 없이 실행**하려면 `config/base.yaml`에서 `persona.sampler`를 `kg_gen`으로 바꿉니다. 이 방식은 KG의 행위자와 정책 맥락을 근거로 LLM이 페르소나를 생성하며, Nemotron에서 표집한 페르소나와는 다른 실험 조건입니다. `persona.kg_gen.personas_per_entity`로 후보 수를 조절합니다.
+두 방식 모두 다음 절의 같은 CLI로 실행합니다. 현재 일반 시나리오 구성 코드는 방식에 관계없이 `persona.scope_definer.num_scenarios`와 `participants_per_scenario`를 읽으므로, `kg_gen`을 선택해도 이 항목은 유지합니다. 고정 역할 패널은 별도의 패널 구성을 사용합니다. 두 방식을 비교할 때는 정책 KG·목표·ToC 스키마·시나리오 구성 조건을 맞추고, 실행별 `--run-tag`로 구분합니다.
 
-## 3. 기본 실행
+## 3. BK21 실행 예시
+
+아래 정책 설명과 예측 목표는 기존 BK21 실행 기록에서 사용한 영어 문구입니다. 준비 단계의 설명은 `BK21 Hanyang University graduate program policy impact`이며, ToC 목표는 2022년 BK21 참여자의 취업률과 국제 공동연구 비율입니다. BK21 정책 원문은 직접 준비하고, 앞 절에서 페르소나 구성 방식을 선택한 뒤 실행합니다.
 
 처음에는 기본 설정의 3개 시나리오 중 1개만 실행해 입력과 출력을 점검합니다. 모든 생성 단계는 실제 LLM을 호출합니다.
 
 ### ① 온톨로지 및 지식 그래프
 
 ```bash
-python main.py gen-ontology "정책의 시행 과정과 이해관계자별 효과 분석" \
-  --policy kor/example \
-  --out outputs/example/ontology/graph_ontology.json
+python main.py gen-ontology "BK21 Hanyang University graduate program policy impact" \
+  --policy kor/bk21 \
+  --out outputs/bk21/ontology/graph_ontology.json
 
-python main.py build-kg "정책의 시행 과정과 이해관계자별 효과 분석" \
-  --policy kor/example \
-  --graph-ontology outputs/example/ontology/graph_ontology.json \
-  --out outputs/example/kg/policy_graph.json
+python main.py build-kg "BK21 Hanyang University graduate program policy impact" \
+  --policy kor/bk21 \
+  --graph-ontology outputs/bk21/ontology/graph_ontology.json \
+  --out outputs/bk21/kg/policy_graph.json
 ```
 
 `build-kg`에서 `--graph-ontology`를 생략하면 온톨로지도 함께 생성합니다. `validation_report.json`이 생성되면 노드·엣지 검증 결과를 함께 확인합니다. 명시적으로 준 `--out` 경로는 자동 출력 경로보다 우선합니다.
@@ -114,19 +167,20 @@ python main.py build-kg "정책의 시행 과정과 이해관계자별 효과 �
 ### ② 페르소나·시나리오 생성
 
 ```bash
-python main.py stage1 "정책의 시행 과정과 이해관계자별 효과 분석" \
-  --policy kor/example \
-  --policy-graph outputs/example/kg/policy_graph.json \
+python main.py stage1 "BK21 Hanyang University graduate program policy impact" \
+  --policy kor/bk21 \
+  --policy-graph outputs/bk21/kg/policy_graph.json \
   --run-tag initial
 ```
 
 출력되는 `run_dir`를 다음 단계에서 사용합니다. 핵심 전달 파일은 `stage1_result.json`, `simulation_personas.json`입니다. 아래 `STAGE1_RUN`은 **방금 출력된 실제 경로로 교체**합니다.
 
 ```bash
-STAGE1_RUN='outputs/kor/example/stage1/<실제 실행 폴더>'
+STAGE1_RUN='outputs/kor/bk21/stage1/<stage1-run-directory>'
+SIMULATION_TARGET='Graduate employment rate of BK21 participants in 2022, international research collaboration rate of BK21 participants in 2022'
 
-python main.py stage2-toc "정책 시행 후 1년간 예상되는 참여 규모와 성과" \
-  --policy kor/example \
+python main.py stage2-toc "$SIMULATION_TARGET" \
+  --policy kor/bk21 \
   --stage1-result "$STAGE1_RUN/stage1_result.json" \
   --scenarios 1-1 \
   --run-tag first
@@ -136,7 +190,7 @@ python main.py stage2-toc "정책 시행 후 1년간 예상되는 참여 규모�
 
 ### ③ 결과 확인
 
-Stage 2 출력은 `outputs/kor/example/stage2_toc/<실행 폴더>/`에 저장됩니다.
+Stage 2 출력은 `outputs/kor/bk21/stage2_toc/<run-directory>/`에 저장됩니다.
 
 | 파일 | 내용 |
 |---|---|
@@ -156,9 +210,12 @@ Stage 2 출력은 `outputs/kor/example/stage2_toc/<실행 폴더>/`에 저장됩
 
 ### 이해관계자와 페르소나
 
-KG에서 행위자 역할을 고른 후 정책 맥락과 연결합니다. 기본 `scope_definer`는 LLM이 연령·학력 범위를 제안하고, DuckDB가 실제 데이터의 직업 후보를 조회한 뒤, LLM이 direct/plausible/weak 범위별 직업을 선택하는 흐름입니다. 필터링한 후보 풀에서 시나리오 참여자를 구성합니다. 기본 설정은 풀이 부족할 때 전체 Nemotron에서 무작위 표집을 허용하므로, 이 대체 표집을 금지하려면 `persona.scope_definer.fallback.enabled: false`로 바꾸고 관련 로그를 확인합니다.
+KG에서 행위자 역할을 고른 후 정책 맥락과 연결합니다. 후보 풀을 구성하는 방법은 두 가지입니다.
 
-`kg_gen`은 데이터 표집 대신 KG 기반 합성 후보를 생성합니다. 조직 행위자의 구조적 맥락과 개인 페르소나를 구분하고, `persona/simulation_schema.py`로 시뮬레이션에 전달할 속성을 정리합니다.
+- **Nemotron 표집 (`scope_definer`)**: 정책 역할에 맞는 인구통계·직업 범위를 정의하고, 로컬 데이터의 프로필을 조회·표집하여 후보를 구성합니다. 데이터에 존재하는 속성 조합과 필터·대체 표집 기록이 후보 구성의 근거가 됩니다.
+- **KG 기반 생성 (`kg_gen`)**: 같은 정책 역할과 맥락을 조건으로 LLM이 프로필을 생성하여 후보를 구성합니다. KG 역할 근거와 생성 프롬프트가 후보 구성의 근거가 되며, 프로필 속성은 합성된 값입니다.
+
+두 방식 모두 조직의 구조적 맥락과 개인 페르소나를 구분하고, `persona/simulation_schema.py`로 전달 속성을 정리한 후 시나리오 또는 고정 역할 패널을 구성합니다. 생성·표집 설정과 후보 출처를 기록하여 후속 ToC 결과를 비교합니다.
 
 고정 역할 패널은 `persona.selection_mode: mechanism_panel`로 활성화합니다. `persona.mechanism_panel.roles`에 해당 정책의 역할·KG 매칭 키워드·제약·ToC 관련 단계를 명시하고, 역할별 후보 중 한 명씩 선택합니다. 모듈에 남아 있는 기본 역할은 의료정책 예제이므로 다른 정책에는 명시적인 역할 정의를 넣어야 합니다. 자동 refiner 패스는 현재 Stage 1에서 비활성화되어 있으며, 필요하면 `scripts/refine_scenario_personas.py`를 별도로 실행합니다.
 
@@ -182,22 +239,22 @@ Inputs → Activities → Outputs → Outcomes → Impact
 ### 순방향/역방향 및 재개
 
 ```bash
-# 순방향만
-python main.py stage2-toc "분석 목표" \
+# Forward only
+python main.py stage2-toc "$SIMULATION_TARGET" \
   --stage1-result "$STAGE1_RUN/stage1_result.json" --no-backward --run-tag forward
 
-# 역방향만: 순방향 Impact를 seed로 사용하지 않는 비교
-python main.py stage2-toc "분석 목표" \
+# Backward only, without the forward Impact seed
+python main.py stage2-toc "$SIMULATION_TARGET" \
   --stage1-result "$STAGE1_RUN/stage1_result.json" --no-forward --run-tag backward
 
-# 기존 스키마 고정 및 완료된 시나리오 재사용
-python main.py stage2-toc "분석 목표" \
+# Reuse the schema and completed scenarios from the same experiment
+python main.py stage2-toc "$SIMULATION_TARGET" \
   --stage1-result "$STAGE1_RUN/stage1_result.json" \
-  --inner-schema outputs/<이전 실행>/inner_schema.json \
-  --resume-from outputs/<이전 실행> --run-tag resumed
+  --inner-schema "outputs/<previous-run-directory>/inner_schema.json" \
+  --resume-from "outputs/<previous-run-directory>" --run-tag resumed
 ```
 
-위 선택 예제는 `--policy`를 생략했으므로 `outputs/stage2_toc/`에 저장됩니다. 정책별 하위 폴더를 원하면 `--policy kor/example`을 추가합니다. 재개는 같은 입력·스키마·조건의 실행에서 사용합니다.
+위 선택 예제는 `--policy`를 생략했으므로 `outputs/stage2_toc/`에 저장됩니다. 정책별 하위 폴더를 원하면 `--policy kor/bk21`을 추가합니다. 재개는 같은 입력·스키마·조건의 실행에서 사용합니다.
 
 추가 체인은 `stage2_toc.fwd_bwd_fwd_seq`, `fwd_bwd_fwd_bwd_seq`, `final_forward_refinement`로 켭니다. 순방향과 역방향의 독립 병렬 실행은 `sequential_backward: false`와 `parallel_forward_backward: true`를 함께 지정합니다. 시나리오 병렬화는 `--parallel-scenarios`로 켤 수 있습니다.
 
@@ -207,7 +264,7 @@ python main.py stage2-toc "분석 목표" \
 
 ```bash
 python scripts/generate_phase_branch_tree.py \
-  --source-dir outputs/<완료된 Stage2 실행> \
+  --source-dir "outputs/<completed-stage2-run-directory>" \
   --scenario 1 \
   --output outputs/branching/pathway_branch_tree.json \
   --max-expansions 1
@@ -220,21 +277,21 @@ python scripts/generate_phase_branch_tree.py \
 ```bash
 python main.py grounded-inputs \
   --stage1-result "$STAGE1_RUN/stage1_result.json" \
-  --policy-graph outputs/example/kg/policy_graph.json \
-  --output outputs/example/grounded_input_state.json
+  --policy-graph outputs/bk21/kg/policy_graph.json \
+  --output outputs/bk21/grounded_input_state.json
 ```
 
-`--policy` 옵션이 없는 명령이므로 다른 정책을 사용할 경우 `--config-path`로 그 정책의 `paths.input_policy_dir`가 지정된 설정을 전달합니다. `scripts/apply_grounded_inputs_to_schema.py`로 생성된 입력 상태를 기존 ToC 스키마에 적용할 수 있습니다.
+`grounded-inputs`에는 `--policy` 옵션이 없으므로, 위 명령을 실행하기 전에 `config/base.yaml`의 `paths.input_policy_dir`를 `dataset/kor/bk21/input_policy`로 지정합니다. 별도 설정 파일을 사용하면 `--config-path`로 전달합니다. `scripts/apply_grounded_inputs_to_schema.py`로 생성된 입력 상태를 기존 ToC 스키마에 적용할 수 있습니다.
 
 ### Baseline / Ablation
 
-기본 파이프라인에는 필요하지 않습니다. 비교 실험 시 `config/policies.yaml`에 정책 Markdown과 새로 생성한 Stage 1의 `simulation_personas.json` 경로를 등록합니다. `config/policy_targets.json`도 직접 준비합니다. 아래 숫자는 형식 예시이며 실험의 실제 목표·관측값으로 바꿉니다.
+기본 파이프라인에는 필요하지 않습니다. 비교 실험 시 `config/policies.yaml`에 정책 Markdown과 새로 생성한 Stage 1의 `simulation_personas.json` 경로를 등록합니다. `config/policy_targets.json`도 직접 준비합니다. 아래 `gt` 숫자는 형식 예시이며 BK21의 실제 관측값이 아닙니다. 평가에 사용할 관측값으로 바꿉니다. `config/policies.yaml`에도 `kor/bk21` 키와 해당 정책의 실제 입력 경로를 등록합니다.
 
 ```json
 {
-  "kor/example": {
-    "simulation_target": "정책 시행 1년 후 참여자 수",
-    "gt": {"participants": 100}
+  "kor/bk21": {
+    "simulation_target": "Graduate employment rate of BK21 participants in 2022, international research collaboration rate of BK21 participants in 2022",
+    "gt": {"employment_rate": 80.0, "international_collaboration_rate": 20.0}
   }
 }
 ```
@@ -250,12 +307,12 @@ python main.py grounded-inputs \
 각 모듈의 `--help`에서 필수 입력을 확인합니다. 예:
 
 ```bash
-python -m zero_shot.predict --policies kor/example --repeats 1
-python -m baseline.predict --policies kor/example --max-scenarios 1
-python -m ablation.baseline_md --policy kor/example --scenarios 1
-python -m ablation.no_kg_toc --policy kor/example \
-  --baseline-run-dir outputs/ablation/baseline_md/<실제 실행> --scenarios 1
-python -m ablation.no_toc --policy kor/example --scenarios 1
+python -m zero_shot.predict --policies kor/bk21 --repeats 1
+python -m baseline.predict --policies kor/bk21 --max-scenarios 1
+python -m ablation.baseline_md --policy kor/bk21 --scenarios 1
+python -m ablation.no_kg_toc --policy kor/bk21 \
+  --baseline-run-dir "outputs/ablation/baseline_md/<run-directory>" --scenarios 1
+python -m ablation.no_toc --policy kor/bk21 --scenarios 1
 ```
 
 단일 ToC CLI에서도 `--simple-prediction`, `--policy-md-override`, Stage 1의 `--no-graph`, KG의 `--no-iadig`로 비교 조건을 구성할 수 있습니다. 조건별 정책 맥락과 페르소나 입력을 확인한 후 사용합니다.
