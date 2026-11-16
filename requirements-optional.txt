@@ -1,0 +1,4 @@
+# Install only if using structured PDF parsing, Gemini, or Zep.
+opendataloader-pdf
+google-genai
+zep-cloud

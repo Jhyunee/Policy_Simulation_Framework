@@ -1,0 +1,5 @@
+# Optional baseline/ablation input registry. Paths are project-relative.
+# Replace the example paths after preparing your own policy and Stage 1 run.
+kor/example:
+  md_path: dataset/kor/example/input_policy/policy.md
+  personas_path: outputs/kor/example/stage1/YOUR_RUN/simulation_personas.json

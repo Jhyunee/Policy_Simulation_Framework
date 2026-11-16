@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+outputs/
+*.log
+dataset/**/input_policy/
+dataset/**/background/
+dataset/processed/pdf_cache/
+dataset/processed/**/Nemotron-Personas-*/
+*.parquet
+config/policy_targets.json
